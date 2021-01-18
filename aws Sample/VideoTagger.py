@@ -4,6 +4,8 @@ import os
 import json
 from pprint import pprint
 import time
+import openpyxl as pyxl
+import shutil
 import boto3
 from botocore.exceptions import ClientError
 import requests
@@ -13,6 +15,9 @@ from rekognition_objects import (
     RekognitionModerationLabel, RekognitionPerson)
     
 from rekognition_video_detection import RekognitionVideo
+
+csvTemplate = 'C:/VMShared/GitRepos/PersonalProject/VideoTagger/BlackBoxMetadataTemplate032218.xlsx'
+rootDir = 'C:/VMShared/GitRepos/PersonalProject/VideoTagger'
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +55,54 @@ def upload_file(file_path, bucketObj, object_name=None):
 
     return object
 
+def CreateNotification(rekogVideoObject):
+    name = rekogVideoObject.video_name
+    # Can't include . in resource names for sns, sqs
+    name_ext = os.path.splitext(name)
+    nameString = name_ext[0] + str(time.time_ns())
+    
+    # First see if a notification channel already exists under this name
+    # there would be a role queue and topic 
+
+    # Create a notification channel for this video
+    print("Creating notification channel from Amazon Rekognition to Amazon SQS.")
+    iam_resource = boto3.resource('iam')
+    sns_resource = boto3.resource('sns')
+    sqs_resource = boto3.resource('sqs')
+    rekogVideoObject.create_notification_channel(
+        nameString , iam_resource, sns_resource, sqs_resource)
+
+def OrganizeTagsByConfidence(labelList):
+    # takes a list of rekognition_objects.RekognitionLabel
+    
+    # this is the lamda function that I will use to organize these rekognition labels
+    # Sort by confidence and by name
+
+    k = lambda i : (i.confidence, i.name)
+
+    for label in labelList:
+        label.to_dict() # Converts the RekognitionLabel into a dictionary
+
+    labelListSorted = sorted(labelList, key = k, reverse=True)
+    return labelListSorted
+
+def RemoveDuplicates(labelList):
+    # can't use set with a key so won't work because we have a list of dictionaries 
+    res = []
+    labelsNoDups = []
+    for i in labelList:
+        if i.name not in res:
+            res.append(i.name)
+            labelsNoDups.append(i)
+
+    return labelsNoDups
+
+def ParseLabels(labelList):
+    # This will likely change as I mess around with additional parameters
+    noDups = RemoveDuplicates(labelList)
+    organized = OrganizeTagsByConfidence(noDups)
+    return organized
+
 class BlackBoxCSVManager:
     ######
     # This class is used to open and manipulate CSV files used for automatically adding meta data
@@ -58,7 +111,7 @@ class BlackBoxCSVManager:
     def __init__(self, filePath):
 
         if filePath == None:
-            self.CreateCSV
+            self.CreateCSV(csvTemplate)
         else:
             self.CSVPath = filePath
 
@@ -70,8 +123,19 @@ class BlackBoxCSVManager:
         # Remove an entry in the csv file
         return
 
-    def CreateCSV(self):
+    def CreateCSV(self, template):
         # Create a new black box csv file
+        # Since we don't have a way to create the file, we copy and rename the Master.xlsx
+        cwdir = os.getcwd()
+
+        shutil.copy(template, cwdir)
+
+        head_tail = template
+
+        os.path.join(cwdir , head_tail[1])
+
+        newName = 'Job' + (str(time.time_ns()))
+        os.rename(cwdir, newName)
         return
 
     def LoadCSV(self):
@@ -106,29 +170,26 @@ def main():
     # This is a making a rekognition object
     rekognition_client = boto3.client('rekognition')
 
-    video = RekognitionVideo.from_bucket(video_object, rekognition_client)
+    rekog_video = RekognitionVideo.from_bucket(video_object, rekognition_client)
     
-    # Create a notification channel for this video
-    print("Creating notification channel from Amazon Rekognition to Amazon SQS.")
-    iam_resource = boto3.resource('iam')
-    sns_resource = boto3.resource('sns')
-    sqs_resource = boto3.resource('sqs')
-    video.create_notification_channel(
-        'doc-example-video-rekognition4', iam_resource, sns_resource, sqs_resource)
+    # Create a SNS Notification Channel so that we can get notified when the video analysis is complete
+    CreateNotification(rekog_video)
 
     print("Detecting labels in the video.")
-    labels = video.do_label_detection()
-    print(f"Detected {len(labels)} labels, here are the first twenty:")
-    for label in labels[:20]:
+    labels = rekog_video.do_label_detection()
+
+    labels_parsed = ParseLabels(labels)
+
+    print('-'*88)
+    for label in labels_parsed[:20]:
         pprint(label.to_dict())
-    input("Press Enter when you're ready to continue.")
 
     print("Deleting resources created for the demo.")
-    video.delete_notification_channel()
+    rekog_video.delete_notification_channel()
     bucket.objects.delete()
     bucket.delete()
     logger.info("Deleted bucket %s.", bucket.name)
-    print("All resources cleaned up. Thanks for watching!")
+    print("All resources cleaned up.")
     print('-'*88)
 
 
