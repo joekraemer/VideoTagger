@@ -50,6 +50,38 @@ def upload_file(file_path, bucketObj, object_name=None):
 
     return object
 
+class BlackBoxCSVManager:
+    ######
+    # This class is used to open and manipulate CSV files used for automatically adding meta data
+    ######
+    
+    def __init__(self, filePath):
+
+        if filePath == None:
+            self.CreateCSV
+        else:
+            self.CSVPath = filePath
+
+    def AddVideo(self):
+        # Make sure that the video file doens't already exist
+        return
+
+    def RemoveVideoEntry(self):
+        # Remove an entry in the csv file
+        return
+
+    def CreateCSV(self):
+        # Create a new black box csv file
+        return
+
+    def LoadCSV(self):
+        # Open CSV so that the class can edit the entries
+        return
+
+    def AddMetadataTags(self, fileName, tags):
+        # Add a list tags (str type) to a video entry in the csv
+        return
+
 def main():
     print('-'*88)
     print("Welcome to the Amazon Rekognition video detection demo!")
