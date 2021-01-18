@@ -310,7 +310,6 @@ class RekognitionVideo:
                 RekognitionModerationLabel(label['ModerationLabel'], label['Timestamp'])
                 for label in response['ModerationLabels']])
 
-
 def usage_demo():
     print('-'*88)
     print("Welcome to the Amazon Rekognition video detection demo!")
@@ -326,7 +325,10 @@ def usage_demo():
             'LocationConstraint': s3_resource.meta.client.meta.region_name
         })
 
-    # Creates an object for each video
+    # Upload each video
+    # targetPath = 'D:\ResolveTestingOneSecond'
+    videoList = ['D:\ResolveTestingOneSecond\ab0ac1119eff4842ad1e1f051efdd081.MOV']
+    
     video_object = bucket.Object('bezos_vogel.mp4')
     bezos_vogel_video = requests.get(
         'https://dhei5unw3vrsx.cloudfront.net/videos/bezos_vogel.mp4', stream=True)
@@ -336,7 +338,8 @@ def usage_demo():
 
     # This is a making a rekognition object
     video = RekognitionVideo.from_bucket(video_object, rekognition_client)
-
+    
+    # Create a notification channel for this video
     print("Creating notification channel from Amazon Rekognition to Amazon SQS.")
     iam_resource = boto3.resource('iam')
     sns_resource = boto3.resource('sns')
