@@ -1,34 +1,61 @@
+import sys
+sys.path.append('../')
 
 import logging
 import os
 import json
+import asyncio
 from pprint import pprint
 import time
 import openpyxl as pyxl
 import shutil
 import boto3
+import threading
+import progressbar
+from pathlib import Path
 from botocore.exceptions import ClientError
 import requests
 
 from rekognition_objects import (
     RekognitionFace, RekognitionCelebrity, RekognitionLabel,
     RekognitionModerationLabel, RekognitionPerson)
-    
+
+# TODO get this reference to work
+# from FindingFilesPackage import filemanager as fm
+
 from rekognition_video_detection import RekognitionVideo
 
 csvTemplate = 'C:/VMShared/GitRepos/PersonalProject/VideoTagger/BlackBoxMetadataTemplate032218.xlsx'
 rootDir = 'C:/VMShared/GitRepos/PersonalProject/VideoTagger'
+targetDir = 'D:/ResolveTestingOneSecond/Booty'
+
+videoExtensions = ["*.mp4", "*.mov", "*.MP4", "*.avi", "*.mkv", "*.m4v"]
 
 logger = logging.getLogger(__name__)
 
-def CreateListOfVideoObject(targetDir, bkt, recursive = True):
-    FindItemsInDirectory(targetDir, )
-    for vid in videoList:
-        print('Uploading:' + str(targetDir))
-        upload_file(vid, bkt )
 
-# Modified from an aws example, use this to upload the footage to a bucket and then run analysis later
-# Might make more sense to run everything asyncronously
+def FindItemsInDirectory(srcDir, extensionList, recursive=True):
+        pathList = []
+        for ext in extensionList:
+            if recursive:
+                ext = "**/" + ext
+            pathList.extend(Path(srcDir).glob(ext))
+        return pathList
+
+class UploadProgressBar():
+    def __init__ (self, size):
+        # Create a progress bar class
+        self.up_progress = progressbar.progressbar.ProgressBar(maxval=size)
+
+    def upload_progress(self, chunk):
+        self.up_progress.update(self.up_progress.currval + chunk)
+
+    def start(self):
+        self.up_progress.start()
+
+    def finish(self):
+        self.up_progress.finish()
+
 def upload_file(file_path, bucketObj, object_name=None):
     """Upload a file to an S3 bucket
 
@@ -40,29 +67,42 @@ def upload_file(file_path, bucketObj, object_name=None):
 
     # If S3 object_name was not specified, use file_name
     if object_name is None:
-        head_tail = os.path.split(file_path) 
+        head_tail = os.path.split(file_path)
         object_name = head_tail[1]
 
     # Create an object
     object = bucketObj.Object(object_name)
 
+    # Get the size of the file 
+    statinfo = os.stat(file_path)
+
+    # Create progress bar 
+    FileUploadProgress = UploadProgressBar(statinfo.st_size)
+
     # Upload the file
     try:
-        response = object.upload_file(file_path)
+        # Start progress bar
+        FileUploadProgress.start()
+
+        response = object.upload_file(file_path.__str__(), Callback=FileUploadProgress.upload_progress)
     except ClientError as e:
         logging.error(e)
         return False
 
+    # Stop Progress bar
+    FileUploadProgress.finish()
+
     return object
+
 
 def CreateNotification(rekogVideoObject):
     name = rekogVideoObject.video_name
     # Can't include . in resource names for sns, sqs
     name_ext = os.path.splitext(name)
     nameString = name_ext[0] + str(time.time_ns())
-    
+
     # First see if a notification channel already exists under this name
-    # there would be a role queue and topic 
+    # there would be a role queue and topic
 
     # Create a notification channel for this video
     print("Creating notification channel from Amazon Rekognition to Amazon SQS.")
@@ -70,24 +110,26 @@ def CreateNotification(rekogVideoObject):
     sns_resource = boto3.resource('sns')
     sqs_resource = boto3.resource('sqs')
     rekogVideoObject.create_notification_channel(
-        nameString , iam_resource, sns_resource, sqs_resource)
+        nameString, iam_resource, sns_resource, sqs_resource)
+
 
 def OrganizeTagsByConfidence(labelList):
     # takes a list of rekognition_objects.RekognitionLabel
-    
+
     # this is the lamda function that I will use to organize these rekognition labels
     # Sort by confidence and by name
 
-    k = lambda i : (i.confidence, i.name)
+    def k(i): return (i.confidence, i.name)
 
     for label in labelList:
-        label.to_dict() # Converts the RekognitionLabel into a dictionary
+        label.to_dict()  # Converts the RekognitionLabel into a dictionary
 
-    labelListSorted = sorted(labelList, key = k, reverse=True)
+    labelListSorted = sorted(labelList, key=k, reverse=True)
     return labelListSorted
 
+
 def RemoveDuplicates(labelList):
-    # can't use set with a key so won't work because we have a list of dictionaries 
+    # can't use set with a key so won't work because we have a list of dictionaries
     res = []
     labelsNoDups = []
     for i in labelList:
@@ -97,11 +139,13 @@ def RemoveDuplicates(labelList):
 
     return labelsNoDups
 
+
 def ParseLabels(labelList):
     # This will likely change as I mess around with additional parameters
     noDups = RemoveDuplicates(labelList)
     organized = OrganizeTagsByConfidence(noDups)
     return organized
+
 
 def ListToString(lst):
     # Takes a lits of strings, in most of these cases, these will be metadata keywords
@@ -114,26 +158,73 @@ def ListToString(lst):
 
     return lstStr
 
+
+def DetectLabelsWithRekog(path, bckt):
+    # Upload each video
+    print('Starting ' + path.name + ' upload')
+    video_object = upload_file(path, bckt)
+
+    # This is a making a rekognition object
+    rekognition_client = boto3.client('rekognition')
+
+    rekog_video = RekognitionVideo.from_bucket(
+        video_object, rekognition_client)
+
+    # Create a SNS Notification Channel so that we can get notified when the video analysis is complete
+    CreateNotification(rekog_video)
+
+    print("Detecting labels in: " + str(video_object.key))
+
+    labels = rekog_video.do_label_detection(labels)
+
+    labels_parsed = ParseLabels(labels)
+
+    print('-'*88)
+    for label in labels_parsed[:20]:
+        pprint(label.to_dict())
+
+    rekog_video.delete_notification_channel()
+    return labels_parsed
+
+
+def GetMetadataFromRekog(path, bckt, BB_CSV_Manager):
+    # We want to queue up this function
+    md = DetectLabelsWithRekog(path, bckt)
+
+    # Once we get data back, we want to lock the csv so it is only
+    # handled by one thread and then update it with the metadata for this video
+    BB_CSV_Manager.LockCSV()
+    BB_CSV_Manager.AddVideo(path.name, md)
+    BB_CSV_Manager.SaveCSV()
+    BB_CSV_Manager.UnlockCSV()
+
+async def CreateBlackBoxCSVWithRekog(path_list, bckt, csvOb):
+    for path in path_list:
+        t = threading.Thread(target = GetMetadataFromRekog, args=(path, bckt, csvOb,)).start()
+
+    return
+
 class BlackBoxCSVManager:
     ######
     # This class is used to open and manipulate CSV files used for automatically adding meta data
     ######
-    
-    def __init__(self, filePath = None):
+
+    def __init__(self, filePath=None):
 
         self.CSVPath = filePath
         self.Workbook = None
         self.NameColumn = 1
         self.KeywordColumn = 3
+        self.csvLock = threading.Lock()
 
-    def AddVideo(self, vidName, metaDataList = None):
-        # Get the template worksheet 
+    def AddVideo(self, vidName, metaDataList=None):
+        # Get the template worksheet
         ws = self.Workbook.worksheets[0]
-        
+
         # Always insert in the same place
         ws.insert_rows(3)
 
-        # Write the name 
+        # Write the name
         # TODO Make sure that the video file doens't already exist
         ws['A3'] = vidName
 
@@ -152,7 +243,7 @@ class BlackBoxCSVManager:
         # Create a new black box csv file
         # Since we don't have a way to create the file, we copy and rename the Master.xlsx
         dir = 'C:\VMShared\GitRepos\PersonalProject\VideoTagger\Results'
-        newName = os.path.join(dir,name + '.xlsx')
+        newName = os.path.join(dir, name + '.xlsx')
         # Copy the template
         shutil.copy(template, newName)
 
@@ -163,38 +254,42 @@ class BlackBoxCSVManager:
 
         # Rename the template to our new Job specific name
         # os.rename(fileToRename, name)
-        
+
         self.CSVPath = newName
         self.Workbook = self.OpenCSV(self.CSVPath)
 
         # Return the path of our new xlsx
         return self.CSVPath
 
-    def OpenCSV(self, filePath = None ):
+    def OpenCSV(self, filePath=None):
 
-        if filePath == None: 
+        if filePath == None:
             filePath = self.CSVPath
         # Open CSV so that the class can edit the entries
         return pyxl.load_workbook(filePath)
 
-    def SaveCSV(self, name = None):
+    def SaveCSV(self, name=None):
         self.Workbook.save(self.CSVPath)
 
-    def CloseCSV(self):
-        # Close CSV
-        return 
+    def LockCSV(self):
+        self.csvLock.acquire()
+        return
+
+    def UnlockCSV(self):
+        self.csvLock.release()
+        return
 
     def AddMetadataTags(self, fileName, tags):
         # Add a list tags (str type) to a video entry in the csv
         # Find the row for the video
         ws = self.Workbook.worksheets[0]
-        for rw in range(2,ws.max_row+1):
-            cellvalue = ws.cell(row=rw, column = self.NameColumn).value
+        for rw in range(2, ws.max_row+1):
+            cellvalue = ws.cell(row=rw, column=self.NameColumn).value
             if cellvalue == fileName:
                 # Found a row matching the fileName
                 # Add the list of metadata to the tags column for this row
                 tags_list = ListToString(tags)
-                ws.cell(row=rw, column = self.KeywordColumn).value = tags_list
+                ws.cell(row=rw, column=self.KeywordColumn).value = tags_list
         return
 
     def FindRow(self, key, clmn):
@@ -202,40 +297,22 @@ class BlackBoxCSVManager:
 
         # Given a search key, look through each cell in the column and return the row numbers where it exists
         for row in range(0, 20):
-                cellValue = csv.cell(column=clmn, row=row, value="{0}".format(get_column_letter(col)))
-                if cellValue == key:
-                    return 
-        
+            cellValue = csv.cell(column=clmn, row=row,
+                                 value="{0}".format(get_column_letter(col)))
+            if cellValue == key:
+                return
+
 
 def main():
 
-    # testing manipulating csv
-    tags1 = ['poo', 'pooop', 'POO']
-    tags2 = ['peepee', 'peee', 'PEE']
-    vid1 = 'butts.mp4'
-    vid2 = 'penis.mov'
-
     name = 'Testing' + str(time.time_ns())
+    # fmanager = fm.FileManager()
 
     csvObj = BlackBoxCSVManager()
-    csvObj.CreateCSV(csvTemplate,name)
+    csvObj.CreateCSV(csvTemplate, name)
 
-    csvObj.AddVideo(vid1)
-    csvObj.AddMetadataTags(vid1, tags1)
-    csvObj.AddVideo(vid2,tags2)
-
-    csvObj.SaveCSV()
-
-    # csvObj.FindRow('booty', 1)
-
-
-    if True:
-        return
-    print('-'*88)
-    print("Welcome to the Amazon Rekognition video detection demo!")
-    print('-'*88)
-
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+    logging.basicConfig(level=logging.INFO,
+                        format='%(levelname)s: %(message)s')
 
     print("Creating Amazon S3 bucket and uploading video.")
     s3_resource = boto3.resource('s3')
@@ -245,17 +322,36 @@ def main():
             'LocationConstraint': s3_resource.meta.client.meta.region_name
         })
 
+    paths = FindItemsInDirectory(targetDir, videoExtensions)
+    
+    # Start asyncronous upload and rekognition tasks
+    asyncio.run(CreateBlackBoxCSVWithRekog(paths, bucket, csvObj))
+
+    # Wait for all tasks to complete
+
+    print("Task Complete.")
+    print("Deleting resources.")
+    bucket.objects.delete()
+    bucket.delete()
+    logger.info("Deleted bucket %s.", bucket.name)
+    print("All resources cleaned up.")
+    print('-'*88)
+
+    if True:
+        return
+#################################################################################
     # Upload each video
     # targetPath = 'D:\ResolveTestingOneSecond'
     videoPath = 'C:/VMShared/GitRepos/PersonalProject/VideoTagger/Videos/testvideo.mp4'
-    
+
     video_object = upload_file(videoPath, bucket)
 
     # This is a making a rekognition object
     rekognition_client = boto3.client('rekognition')
 
-    rekog_video = RekognitionVideo.from_bucket(video_object, rekognition_client)
-    
+    rekog_video = RekognitionVideo.from_bucket(
+        video_object, rekognition_client)
+
     # Create a SNS Notification Channel so that we can get notified when the video analysis is complete
     CreateNotification(rekog_video)
 
@@ -278,4 +374,4 @@ def main():
 
 
 if __name__ == '__main__':
-        main()
+    main()
