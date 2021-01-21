@@ -14,6 +14,7 @@ import threading
 import progressbar
 from pathlib import Path
 from botocore.exceptions import ClientError
+from concurrent.futures.thread import ThreadPoolExecutor
 import requests
 
 from rekognition_objects import (
@@ -140,12 +141,18 @@ def RemoveDuplicates(labelList):
     return labelsNoDups
 
 
+def StripLabelsFromLabelObj(labelList):
+    labelListAsString = []
+    for labelObj in labelList:
+        labelListAsString.append(labelObj.name)
+    return labelListAsString
+
 def ParseLabels(labelList):
     # This will likely change as I mess around with additional parameters
     noDups = RemoveDuplicates(labelList)
     organized = OrganizeTagsByConfidence(noDups)
-    return organized
-
+    labelString = StripLabelsFromLabelObj(organized)
+    return labelString
 
 def ListToString(lst):
     # Takes a lits of strings, in most of these cases, these will be metadata keywords
@@ -175,13 +182,9 @@ def DetectLabelsWithRekog(path, bckt):
 
     print("Detecting labels in: " + str(video_object.key))
 
-    labels = rekog_video.do_label_detection(labels)
+    labels = rekog_video.do_label_detection()
 
     labels_parsed = ParseLabels(labels)
-
-    print('-'*88)
-    for label in labels_parsed[:20]:
-        pprint(label.to_dict())
 
     rekog_video.delete_notification_channel()
     return labels_parsed
@@ -198,9 +201,17 @@ def GetMetadataFromRekog(path, bckt, BB_CSV_Manager):
     BB_CSV_Manager.SaveCSV()
     BB_CSV_Manager.UnlockCSV()
 
-async def CreateBlackBoxCSVWithRekog(path_list, bckt, csvOb):
-    for path in path_list:
-        t = threading.Thread(target = GetMetadataFromRekog, args=(path, bckt, csvOb,)).start()
+def CreateBlackBoxCSVWithRekog(path_list, bckt, csvOb, enableMultithread = True):
+
+
+    if enableMultithread:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            for path in path_list:
+                executor.submit(GetMetadataFromRekog, path, bckt, csvOb)
+    
+    else:
+        for path in path_list:
+            GetMetadataFromRekog(path, bckt, csvOb)
 
     return
 
@@ -306,8 +317,7 @@ class BlackBoxCSVManager:
 def main():
 
     name = 'Testing' + str(time.time_ns())
-    # fmanager = fm.FileManager()
-
+    
     csvObj = BlackBoxCSVManager()
     csvObj.CreateCSV(csvTemplate, name)
 
@@ -325,9 +335,7 @@ def main():
     paths = FindItemsInDirectory(targetDir, videoExtensions)
     
     # Start asyncronous upload and rekognition tasks
-    asyncio.run(CreateBlackBoxCSVWithRekog(paths, bucket, csvObj))
-
-    # Wait for all tasks to complete
+    CreateBlackBoxCSVWithRekog(paths, bucket, csvObj, False)
 
     print("Task Complete.")
     print("Deleting resources.")
@@ -336,42 +344,6 @@ def main():
     logger.info("Deleted bucket %s.", bucket.name)
     print("All resources cleaned up.")
     print('-'*88)
-
-    if True:
-        return
-#################################################################################
-    # Upload each video
-    # targetPath = 'D:\ResolveTestingOneSecond'
-    videoPath = 'C:/VMShared/GitRepos/PersonalProject/VideoTagger/Videos/testvideo.mp4'
-
-    video_object = upload_file(videoPath, bucket)
-
-    # This is a making a rekognition object
-    rekognition_client = boto3.client('rekognition')
-
-    rekog_video = RekognitionVideo.from_bucket(
-        video_object, rekognition_client)
-
-    # Create a SNS Notification Channel so that we can get notified when the video analysis is complete
-    CreateNotification(rekog_video)
-
-    print("Detecting labels in the video.")
-    labels = rekog_video.do_label_detection()
-
-    labels_parsed = ParseLabels(labels)
-
-    print('-'*88)
-    for label in labels_parsed[:20]:
-        pprint(label.to_dict())
-
-    print("Deleting resources created for the demo.")
-    rekog_video.delete_notification_channel()
-    bucket.objects.delete()
-    bucket.delete()
-    logger.info("Deleted bucket %s.", bucket.name)
-    print("All resources cleaned up.")
-    print('-'*88)
-
 
 if __name__ == '__main__':
     main()
